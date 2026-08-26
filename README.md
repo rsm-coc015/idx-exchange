@@ -16,103 +16,113 @@ characteristics at the time of the query.
 property's characteristics — living area, bedrooms, bathrooms, lot size,
 location, and more — sourced from CRMLS.
 
-## Data
+## Dataset Source
 
-- **Source**: CRMLS (`CRMLSSold*.csv` files), accessed via FTP from
-  `raw/California`.
-- **Scope**: `PropertyType = Residential` and
-  `PropertySubType = SingleFamilyResidence` only, per task requirements.
-- **Coverage used in this analysis**: `california_sfr_202505_202605.csv`
-  (~142K rows, 12 months of sales).
-- **Metadata**: field definitions are documented in
-  `Trestle Property MetaData.pdf` (see `resources/`).
+- **Source:** CRMLS (California Regional Multiple Listing Service) monthly sold-listing CSV exports
+- **Scope:** `PropertyType == "Residential"` and `PropertySubType == "SingleFamilyResidence"` listings across California
+- **Coverage:** 17 monthly files (Feb 2025 – Jun 2026); 186,196 rows after property-type filtering
+- **Train / Validation / Test split** (time-based, by `CloseDate`):
 
-Raw data files are not committed to this repo — see `data_setup.ipynb` for how
-to load them locally.
+| Split | Date range | Rows |
+|---|---|---|
+| Train | 2025-02-01 – 2026-01-31 | 129,477 |
+| Validation | 2026-02-01 – 2026-05-31 | 43,755 |
+| Test | 2026-06-01 – 2026-06-30 | 12,853 |
 
-## Repo Structure
 
-```
-idx-exchange/
-├── README.md
-├── data_setup.ipynb        # Data loading utilities
-├── 01_exploration.ipynb    # Week 2: EDA, data cleaning, feature selection
-└── .gitignore
-```
+## Feature Selection Process
 
-## Progress
+The team inventoried 83 raw CRMLS columns and divided them into 5 functional groups. Each member reviewed their assigned group; the team then collectively decided which features carried meaningful predictive signal.
 
-### ✅ Week 1 — Orientation & Setup
-- Confirmed dataset access via FTP.
-- Reviewed `Trestle Property MetaData.pdf` for field definitions.
+| Group | Purpose | Raw columns | Final features |
+|---|---|---|---|
+| Property Features | Predictive features about the house itself | 26 | ~10 |
+| Location & Neighborhood | Geographic and school-related features | 18 | 7 |
+| Lot & Financial | Price, taxes, HOA, and lot characteristics | 13 | 4 |
+| Listing & Transaction | Time-based listing history and sale information | 10 | 0 (excluded — mostly known only after sale closes) |
+| Agents & Offices | Brokerage and agent metadata | 16 | 0 (excluded — not price-predictive) |
 
-### ✅ Week 2 — Data Exploration (`01_exploration.ipynb`)
+**Location & Neighborhood** : narrowed from 18 to 7 via Pearson correlation, ANOVA F-tests, and a missingness/cardinality screen (drop if >80% missing or cardinality outside 2–5,000):
 
-**Target variable (`ClosePrice`) cleaning**
-- Found and removed 1 record with `ClosePrice <= 0` — this had been silently
-  corrupting all downstream correlation/ANOVA calculations (`log(0) = -inf`,
-  which `dropna()` does not catch).
-- Computed `price_ratio = ClosePrice / ListPrice` to catch systematic data
-  entry errors. Found a batch of records with `price_ratio` ≈ 1000 — a
-  confirmed unit error, corrected by dividing by 1000 rather than dropping.
-  Remaining extreme ratios (~0.3–0.5% of rows) were filtered using
-  data-driven quantile cutoffs (0.5th–99.95th percentile).
-- Modeling target: `log_price = log(ClosePrice)`.
+\```python
+location_features = [
+    "Latitude",
+    "Longitude",
+    "City",
+    "PostalCode",
+    "CountyOrParish",
+    "MLSAreaMajor",
+    "HighSchoolDistrict",
+]
+\```
 
-**Location & Neighborhood feature selection**
-- Evaluated 18 location-related columns using Pearson correlation (numeric)
-  and ANOVA F-tests (categorical) against `log_price`.
-- **Retained 7 features**: `Latitude`, `Longitude`, `City`, `PostalCode`,
-  `CountyOrParish`, `MLSAreaMajor`, `HighSchoolDistrict`.
-- Dropped columns with 100% missingness, ID-like cardinality
-  (`UnparsedAddress`), no variance (`StateOrProvince`), or excessive missing
-  rates relative to explanatory power (`HighSchool`, `MiddleOrJuniorSchool`,
-  `ElementarySchool`).
+## Preprocessing Steps
 
-**EDA on retained features**
-1. **Geographic distribution** — found and corrected longitude sign-flip
-   errors (12 rows); dropped remaining unrecoverable out-of-state/invalid
-   coordinates.
-2. **Price distribution by county** — confirmed Bay Area counties (Santa
-   Clara, San Mateo) have the highest median prices; inland counties (Kern,
-   Merced) the lowest, consistent with known CA housing patterns.
-3. **Missing value patterns** — `MLSAreaMajor` and `HighSchoolDistrict`
-   missingness is not random; it's concentrated in specific counties,
-   likely reflecting differences in regional MLS system coverage rather
-   than data volume. Flagged as a model limitation.
-4. **Sample size per category** — `PostalCode` and `City` have many sparse
-   categories (<10 samples); will require smoothed target encoding or
-   bucketing before use in non-tree models.
-5. **Multicollinearity** — `City`, `PostalCode`, and `CountyOrParish` are
-   highly overlapping (Cramér's V 0.91–0.98); `MLSAreaMajor` is the most
-   independent location signal. Relevant for Linear Regression (coefficient
-   stability) but not for tree-based models.
+1. **Target transformation:** `log_price = log(ClosePrice)`, for `ClosePrice > 0`. Training on the log scale (rather than raw dollars) was validated via an A/B test in `05_advanced_models.ipynb` — the log-target model outperformed a raw-dollar-target model on every metric (RMSE, MAE, R², MAPE)
+2. **Geographic cleaning:** Dropped rows with coordinates outside California's valid range; fixed 12 longitude sign-flip errors (positive instead of negative longitude) rather than discarding them; 37 remaining invalid-coordinate rows dropped
+3. **Feature engineering:** `bed_bath_ratio`, `property_age` (negative ages from data-entry errors clipped to 0), `amenity_score`
+4. **School district spatial join:** `geopandas` point-in-polygon join against a California school-district boundary file to assign `DistrictName`; unmatched properties (24.19%) flagged as missing rather than dropped
+5. **Missing value handling:** Median/mode imputation with a `_missing` indicator flag per column, so the model can still learn from the fact that a value was missing
+6. **Outlier filtering:** Extreme `price_ratio` (ClosePrice / ListPrice) values — capped at the train-set 0.5th–99.95th percentiles — removed to eliminate likely data-entry errors. This had a very large impact on tree-based model performance (e.g., XGBoost validation R² improved from 0.02 to 0.84)
+7. **Categorical encoding:** High-cardinality fields (City, PostalCode, CountyOrParish, MLSAreaMajor, HighSchoolDistrict, DistrictName) use smoothed target encoding fit on train only; low-cardinality YN flags use one-hot encoding
+8. **Normalization:** `StandardScaler`, applied only where needed (Linear Regression), not for tree-based models
+9. **Final feature set:** 42 modeling features exported to `train.csv` / `validation.csv` / `test.csv`
 
-### ⬜ Week 3 — Data Preprocessing
-- Handle missing values (impute/flag), encode categorical variables, scale
-  numeric features.
-- Train/test split: most recent month as test set, preceding X months as
-  training (X to be tuned).
 
-### ⬜ Week 4 — Baseline Model (Linear Regression)
-### ⬜ Week 5 — Additional Models (Decision Tree, Random Forest)
-### ⬜ Week 6 — Feature Engineering (bed/bath ratio, property age, school
-district spatial join)
-### ⬜ Week 7 — Advanced Models (XGBoost / LightGBM)
-### ⬜ Week 8 — Evaluation Expansion (MAPE, MdAPE)
-### ⬜ Week 9 — OPTIONAL: Streamlit Prediction App
-### ⬜ Week 10 — Documentation
-### ⬜ Week 11 — Practice Presentation
-### ⬜ Week 12 — Final Presentation & Handoff
+## Models Tested
 
-## Methodology Notes
+| Model | Tuning approach |
+|---|---|
+| Linear Regression | VIF-based feature pruning; evaluated on the dollar scale after applying the data-quality caps above |
+| Decision Tree | `GridSearchCV` with `TimeSeriesSplit` CV and a custom dollar-scale R² scorer |
+| Random Forest | `GridSearchCV` with `TimeSeriesSplit` CV and a custom dollar-scale R² scorer |
+| XGBoost | Grid search (max_depth, learning_rate, n_estimators) → sample weighting (3× for luxury properties) → `RandomizedSearchCV` for regularization → ensembling |
+| LightGBM | Same pipeline as XGBoost |
 
-- **Target variable**: `log(ClosePrice)`, chosen for its closer-to-normal
-  distribution and better suitability for regression.
-- **Train/test split**: time-based (train on earlier months, test on the
-  most recent month) to reflect real-world deployment — the model must
-  predict *future* prices, not interpolate within the same time period.
-- **Model-specific feature handling**: tree-based models (Decision Tree,
-  Random Forest, LightGBM) can consume raw categorical columns and missing
-  values natively; Linear Regression requires encoding, imputation, and
-  more careful handling of multicollinearity.
+**Additional experiments:**
+- Sample weighting for luxury properties (>$2M) to address their underrepresentation in training data
+- Weighted ensemble of XGBoost + LightGBM
+- Regularization search (`RandomizedSearchCV`, 50 candidates × 5-fold CV) to reduce train-validation overfitting
+- A luxury-segment specialist model (trained only on >$2M properties) was tested and **rejected** — it underperformed the global model on the same subset, confirming the luxury segment's sample size is too small to support a standalone model
+
+
+**Model comparison (test set):**
+
+**Model comparison (test set):**
+
+| Model | R² | MAPE | MdAPE |
+|---|---|---|---|
+| Decision Tree | 0.7286 | 17.66% | 12.65% |
+| Random Forest | 0.8177 | 11.98% | 7.83% |
+| XGBoost | 0.8473 | 11.58% | 7.88% |
+| LightGBM | 0.8480 | 11.65% | 8.02% |
+| XGBoost weighted | 0.8493 | 11.91% | 8.13% |
+| LightGBM weighted | 0.8573 | 11.90% | 8.13% |
+| Ensemble (weighted, no reg) | 0.8575 | 11.77% | 8.01% |
+| XGB auto-tuned (weighted + regularized) | 0.8497 | 12.89% | 8.86% |
+| LGBM auto-tuned (weighted + regularized) | 0.8422 | 12.63% | 8.63% |
+| Final Ensemble (auto-tuned) | 0.8502 | 12.71% | 8.67% |
+
+## Best Results
+
+**Final model:** Weighted ensemble of XGBoost (70%) and LightGBM (30%), each individually tuned via `RandomizedSearchCV` with regularization
+
+**Test set performance:**
+
+| Metric | Value |
+|---|---|
+| RMSE | $565,695 |
+| MAE | $190,045 |
+| R² | 0.8502 |
+| MAPE | 12.71% |
+| MdAPE | 8.67% |
+| Train-Val Gap | 0.0608 |
+
+**Performance by price band (test set, final ensemble):**
+
+| Price Band | MAPE | MdAPE |
+|---|---|---|
+| <$500K | 16.94% | 9.18% |
+| $500K–$1M | 9.84% | 6.84% |
+| $1M–$2M | 13.44% | 10.33% |
+| $2M+ | 15.46% | 12.21% |
